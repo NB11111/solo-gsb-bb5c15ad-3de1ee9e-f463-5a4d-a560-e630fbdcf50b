@@ -57,6 +57,17 @@ def part_path(session_id: str, start: int, end: int) -> Path:
     return parts_dir(session_id) / f"{start}-{end}"
 
 
+def part_repair_backup_path(session_id: str, start: int, end: int) -> Path:
+    """已收分片原位修复期间旧分片的同目录备份路径。
+
+    与分片成品位于同一目录（同一文件系统），因此新旧分片互换只是
+    目录内 rename，全程原子；会话锁保证同一会话同时只有一个修复，
+    固定名称不会冲突。它以点号开头，拼装时只按 chunks 表取
+    ``<start>-<end>`` 正式分片，备份永远不会被读入成品。
+    """
+    return parts_dir(session_id) / f".{start}-{end}.repairbak"
+
+
 def artifact_path(session_id: str) -> Path:
     return files_dir() / session_id
 
@@ -90,6 +101,29 @@ def remove_session_tree(session_id: str) -> None:
 def sweep_old_tempfiles(older_than: datetime) -> None:
     """删除早于给定时间的临时文件（崩溃残留）。"""
     for entry in tmp_dir().glob("*"):
+        try:
+            mtime = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc)
+        except FileNotFoundError:
+            continue
+        if mtime < older_than and entry.is_file():
+            try:
+                entry.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def sweep_repair_backups(older_than: datetime) -> None:
+    """删除分片目录中崩溃残留的修复备份（.repairbak，正常路径会立即回收）。
+
+    备份文件不参与拼装（拼装只按 chunks 表取正式分片名），残留无害；
+    这里只负责回收磁盘空间。仍处于上传中的会话目录也会被清扫：能残留
+    超过时长只可能来自进程崩溃，而不是进行中的修复（修复持有会话锁且
+    持续时间以秒计）。
+    """
+    parts_root = settings.data_dir / "parts"
+    if not parts_root.exists():
+        return
+    for entry in parts_root.glob("*/.*.repairbak"):
         try:
             mtime = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc)
         except FileNotFoundError:

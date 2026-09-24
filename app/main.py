@@ -4,6 +4,7 @@
   POST   /sessions                      创建上传会话（可选 Idempotency-Key 幂等创建）
   GET    /sessions/{id}                 查询状态与缺失区间
   PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间；可选 X-Chunk-SHA256 逐片校验）
+  PUT    /sessions/{id}/chunks/repair   已收分片原位修复（区间必须与某已登记分片完全一致；可选 X-Chunk-SHA256）
   POST   /sessions/{id}/copy-chunk      从已完成来源会话的成品服务端复制一段为目标会话分片
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
@@ -388,6 +389,256 @@ def _chunk_accepted_payload(session_id: str, start: int, end: int) -> dict:
         "fully_received": payload["fully_received"],
         "expires_at": payload["expires_at"],
     }
+
+
+# ---------------------------------------------------------------------------
+# 已收分片原位修复（PUT /chunks/repair）
+#
+# 与普通 PUT 分片的区别只有一点：区间必须与一条**已登记**分片完全一致，
+# 新内容等长地**替换**旧分片，不新增区间、不改变 bytes_received 与缺失
+# 区间。整体两阶段结构沿用 PUT 分片：
+#   1. _prepare_chunk_repair 持会话锁做首次权威校验（会话仍在上传、
+#      区间与某已登记分片完全一致、长度/单片上限合法），但**不**滑动
+#      TTL——任何修复失败都保持会话与分片原样，包括过期时间。
+#   2. 请求体流式落到 tmp（可增量计算 X-Chunk-SHA256），随后
+#      _commit_chunk_repair 再次持会话锁，在单个 BEGIN IMMEDIATE 事务内
+#      二次校验，并用“旧分片同目录备份 → 新分片原子 rename 落位 →
+#      更新 last_access/expires_at”的顺序完成替换；任一步失败都把旧
+#      分片原子恢复回来，客户端可用旧内容重试。
+# 流式接收期间（不持锁）并发完成/放弃只会得到两种干净结局：
+# 完成先发生 → 修复在事务内看到 completed 返回 409，磁盘分片随完成清理
+# 被删除，临时文件由修复自行删除，成品早已发布；放弃先发生 → 修复看到
+# 404，分片目录被硬删除。任何一方都读不到“半替换”的分片。
+# ---------------------------------------------------------------------------
+
+
+def _prepare_chunk_repair(
+    session_id: str, start: int, end: int, declared_length: int
+) -> None:
+    """线程池中执行：修复前的首次权威校验（不滑动 TTL、不改任何状态）。"""
+    with session_locks.get(session_id):
+        row = _load_session(session_id)
+        if row["status"] == "completed":
+            raise _http(409, "session already completed; no more chunks accepted")
+        if end > row["total_size"]:
+            raise _http(
+                400,
+                "chunk range exceeds total_size",
+                start=start,
+                end=end,
+                total_size=row["total_size"],
+            )
+        if settings.max_chunk_bytes and end - start > settings.max_chunk_bytes:
+            raise _http(
+                413,
+                "chunk larger than MAX_CHUNK_BYTES",
+                max_chunk_bytes=settings.max_chunk_bytes,
+            )
+        if declared_length != end - start:
+            raise _http(
+                400,
+                "content-length does not match end-start",
+                content_length=declared_length,
+                expected=end - start,
+            )
+        # 区间必须与一条已登记分片**完全一致**（同一半开区间）；
+        # 仅相交、相邻或落在合并区间内但跨过分片边界都不算。
+        conn = db.get_conn()
+        exact = conn.execute(
+            "SELECT 1 FROM chunks "
+            "WHERE session_id = ? AND start_offset = ? AND end_offset = ?",
+            (session_id, start, end),
+        ).fetchone()
+        if exact is None:
+            raise _http(
+                404,
+                "no registered chunk matches the range exactly",
+                start=start,
+                end=end,
+            )
+
+
+def _commit_chunk_repair(
+    session_id: str, start: int, end: int, tmp_file: str
+) -> dict:
+    """事务内把旧分片原子替换为新内容；任何失败都恢复旧分片。"""
+    tmp_path = Path(tmp_file)
+    final = storage.part_path(session_id, start, end)
+    backup = storage.part_repair_backup_path(session_id, start, end)
+    with session_locks.get(session_id):
+        try:
+            with db.immediate() as tx:
+                row = tx.execute(
+                    "SELECT * FROM upload_sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if row is None:
+                    raise _http(404, "session not found")
+                if row["status"] in ("aborted", "expired") or (
+                    row["status"] == "uploading"
+                    and storage.parse_iso(row["expires_at"]) <= storage.utcnow()
+                ):
+                    raise _http(410, "session no longer active")
+                if row["status"] == "completed":
+                    raise _http(409, "session already completed")
+                if end > row["total_size"]:
+                    raise _http(400, "chunk range exceeds total_size")
+
+                # 事务内复查登记仍在（并发放弃会整行删除会话与级联分片）。
+                exact = tx.execute(
+                    "SELECT 1 FROM chunks "
+                    "WHERE session_id = ? AND start_offset = ? AND end_offset = ?",
+                    (session_id, start, end),
+                ).fetchone()
+                if exact is None:
+                    raise _http(
+                        404,
+                        "no registered chunk matches the range exactly",
+                        start=start,
+                        end=end,
+                    )
+
+                # 文件替换全程在 parts/<sid>/ 同一目录内：先把旧分片改名
+                # 备份，再让新分片落位，两步都是同卷原子 rename，
+                # 磁盘上任何瞬间要么是旧分片、要么是新分片，不存在半成品。
+                final.parent.mkdir(parents=True, exist_ok=True)
+                if final.is_file():
+                    final.replace(backup)
+                tmp_path.replace(final)
+
+                # 只滑动活动时间：区间登记（chunks 行）与 bytes_received
+                # 一律不动，缺失区间自然保持不变。
+                now = storage.utcnow()
+                now_iso = storage.iso(now)
+                tx.execute(
+                    "UPDATE upload_sessions "
+                    "SET last_access_at = ?, expires_at = ? WHERE id = ?",
+                    (
+                        now_iso,
+                        storage.iso(now + timedelta(seconds=settings.ttl_seconds)),
+                        session_id,
+                    ),
+                )
+        except BaseException:
+            # 事务已回滚（登记与字节数保持旧值）。磁盘恢复只看备份是否
+            # 存在：备份在，说明旧分片已被改名——无论新分片是否落位，
+            # 都删掉正式路径并把备份原子改回，覆盖两次 rename 之间失败的
+            # 极端情况；备份不在，说明替换从未开始，旧分片原封不动。
+            if backup.exists():
+                final.unlink(missing_ok=True)
+                backup.replace(final)
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        # 提交成功后备份才完成使命（旧分片已被新版本取代）。
+        backup.unlink(missing_ok=True)
+
+    return _chunk_accepted_payload(session_id, start, end)
+
+
+@app.put(
+    "/api/v1/sessions/{session_id}/chunks/repair",
+    response_model=schemas.ChunkResponse,
+    tags=["chunks"],
+)
+async def repair_chunk(
+    session_id: str,
+    request: Request,
+    start: int = Query(..., ge=0, description="起始偏移（含）"),
+    end: int = Query(..., ge=0, description="结束偏移（不含），半开区间 [start, end)"),
+    chunk_sha256: str | None = Header(
+        default=None,
+        alias="X-Chunk-SHA256",
+        description=(
+            "可选：新分片内容的 SHA-256（64 位十六进制，可带 sha256: 前缀）。"
+            "提供时服务端流式校验长度与摘要；格式错误返回 400、长度不符返回 "
+            "400/413、摘要不匹配返回 422，均保留原分片且不滑动 TTL。"
+        ),
+    ),
+) -> dict:
+    if end <= start:
+        raise _http(
+            400, "invalid range: require 0 <= start < end", start=start, end=end
+        )
+    declared_raw = request.headers.get("content-length")
+    if declared_raw is None:
+        raise _http(411, "content-length header is required")
+    try:
+        declared_length = int(declared_raw)
+    except ValueError:
+        raise _http(400, "invalid content-length header")
+    if declared_length != end - start:
+        raise _http(
+            400,
+            "content-length does not match end-start",
+            content_length=declared_length,
+            expected=end - start,
+        )
+    if settings.max_chunk_bytes and declared_length > settings.max_chunk_bytes:
+        raise _http(
+            413, "chunk larger than MAX_CHUNK_BYTES",
+            max_chunk_bytes=settings.max_chunk_bytes,
+        )
+    # 与普通 PUT 一致：头格式错误在读体之前拒绝，不滑动 TTL、不接触存储。
+    if chunk_sha256 is not None:
+        try:
+            expected_chunk_digest = schemas.normalize_sha256(chunk_sha256)
+        except ValueError:
+            raise _http(
+                400,
+                "invalid X-Chunk-SHA256 header",
+                requirement="64 lowercase hex characters, optional sha256: prefix",
+            )
+    else:
+        expected_chunk_digest = None
+
+    await run_sync(_prepare_chunk_repair, session_id, start, end, declared_length)
+
+    # 流式接收与逐片摘要计算与普通 PUT 完全相同：失败只清理临时文件，
+    # 旧分片与其登记从这一刻起根本还没被触碰。
+    tmp = storage.new_temp_file()
+    received = 0
+    digest = hashlib.sha256() if expected_chunk_digest is not None else None
+    try:
+        with tmp.open("wb") as out:
+            async for block in request.stream():
+                received += len(block)
+                if received > declared_length:
+                    raise _http(
+                        413,
+                        "request body longer than declared range",
+                        declared=declared_length,
+                    )
+                out.write(block)
+                if digest is not None:
+                    digest.update(block)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    if received != end - start:
+        tmp.unlink(missing_ok=True)
+        raise _http(
+            400,
+            "body length does not match declared range",
+            bytes_received=received,
+            expected=end - start,
+        )
+
+    if digest is not None:
+        actual_chunk_digest = digest.hexdigest()
+        if actual_chunk_digest != expected_chunk_digest:
+            # 摘要不符：临时文件删除即可，旧分片、登记与字节数原封不动。
+            tmp.unlink(missing_ok=True)
+            raise _http(
+                422,
+                "chunk sha256 mismatch",
+                start=start,
+                end=end,
+                expected=expected_chunk_digest,
+                actual=actual_chunk_digest,
+            )
+
+    return await run_sync(_commit_chunk_repair, session_id, start, end, str(tmp))
 
 
 @app.put(

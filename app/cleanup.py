@@ -87,6 +87,10 @@ def run_cleanup(now: storage.datetime | None = None) -> list[str]:
     storage.sweep_old_tempfiles(
         (now or storage.utcnow()) - timedelta(hours=1)
     )
+    # 原位修复崩溃可能残留的旧分片备份（正常成功/失败路径都会立即回收）。
+    storage.sweep_repair_backups(
+        (now or storage.utcnow()) - timedelta(hours=1)
+    )
     return expired
 
 
